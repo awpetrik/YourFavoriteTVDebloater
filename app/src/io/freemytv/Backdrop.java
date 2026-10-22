@@ -16,18 +16,20 @@ import android.graphics.Shader;
  *  - the frosted version (192×108, heavily blurred) of the same image: the background of the frosted glass and of the
  *    bottom drawer;
  *  - the Liquid Glass version (480×270, lightly blurred): the photo shows through the shelf and the cards;
- *  - with forLight: the cards (the photo without scrims, cropped wide and tall, already at the focused card size) and
- *    the frosted and glass versions blended with white (by day) and with near-black (at night).
- * Only what is needed gets built (with forLight, no full photo: the cards are lightweight, so all 9 for the three tabs
- * fit in memory, ready); the other fields stay null.
+ *  - with forLight: the cards (at their resting sizes: the wide one cropped from the photo, the tall one from the
+ *    title's poster, or the photo cropped when there is no poster; the row's morph interpolates between the two)
+ *    and the title's logo, plus the frosted and glass versions blended with white (by day) and with near-black
+ *    (at night).
+ * Only what is needed gets built (with forLight, no full photo: the cards are lightweight, so one tab's ten fit
+ * in memory, ready); the other fields stay null.
  * The final image lives only in GPU memory (HARDWARE): drawing it costs one texture, and the process doesn't hold 8 MB.
  */
 final class Backdrop {
     /** The UI's size against 1920×1080 (at most 1): nothing is built bigger than the screen can show. */
     private static final float UI_SCALE = uiScale();
     static final int W = ui(1920), H = ui(1080), FW = 192, FH = 108, GW = 480, GH = 270;
-    /** The cards at their focused size (1.05×): the wide one and the two tall ones. */
-    static final int WIDE_W = ui(1092), WIDE_H = ui(464), TALL_W = ui(336), TALL_H = ui(464);
+    /** The cards at their resting sizes: the wide (expanded) one and the tall (poster) one, both one card high. */
+    static final int WIDE_W = ui(930), WIDE_H = ui(470), TALL_W = ui(313), TALL_H = ui(470);
 
     private static float uiScale() {
         android.util.DisplayMetrics m = android.content.res.Resources.getSystem().getDisplayMetrics();
@@ -42,18 +44,22 @@ final class Backdrop {
     final int[] frost;      // heavily blurred (frosted glass, bottom drawer)
     final int[] glass;      // lightly blurred (Liquid Glass: the photo shows through the glass)
     final Bitmap wide, tall;            // the photo on the cards
+    final Bitmap logo;                  // the title's logo on the cards (light design only)
+    final boolean logoDark;             // the logo's ink is dark: it gets a light scrim instead of a dark one
     final int[] light, lightGlass;      // by day: the frosted and glass versions, lightened
     final Bitmap lightImage;            // by day: the background (the lightened frosted version, scaled up on screen)
     final int[] nightFrost, nightGlass; // at night: frosted (the bottom drawer's frosted glass) and glass, darkened
     final Bitmap nightImage;            // at night: the background (the darkened frosted version)
 
-    private Backdrop(Bitmap image, int[] frost, int[] glass, Bitmap wide, Bitmap tall, int[] light, int[] lightGlass,
-                     int[] night, int[] nightGlass) {
+    private Backdrop(Bitmap image, int[] frost, int[] glass, Bitmap wide, Bitmap tall, Bitmap logo, boolean logoDark,
+                     int[] light, int[] lightGlass, int[] night, int[] nightGlass) {
         this.image = image;
         this.frost = frost;
         this.glass = glass;
         this.wide = wide;
         this.tall = tall;
+        this.logo = logo;
+        this.logoDark = logoDark;
         this.light = light;
         this.lightGlass = lightGlass;
         this.nightFrost = night;
@@ -62,7 +68,7 @@ final class Backdrop {
         nightImage = night == null ? null : Bitmap.createBitmap(night, FW, FH, Bitmap.Config.ARGB_8888);
     }
 
-    static Backdrop make(Bitmap src, boolean forLight) {
+    static Backdrop make(Bitmap src, Bitmap poster, Bitmap logo, boolean forLight) {
         Bitmap out = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(out);
         Paint photo = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
@@ -71,8 +77,13 @@ final class Backdrop {
         c.drawBitmap(src, null, new RectF((W - sw) / 2, (H - sh) / 2, (W + sw) / 2, (H + sh) / 2), photo);
         src.recycle();
         if (forLight) {
-            // Light design: everything comes from the photo without scrims.
-            Bitmap wide = card(out, WIDE_W, WIDE_H), tall = card(out, TALL_W, TALL_H);
+            // Light design: everything comes from the photo without scrims. The wide card crops the photo; the two
+            // narrow ones take the title's poster (2:3, the artwork the apps themselves show), and fall back to a
+            // crop of the photo when the poster is missing.
+            Bitmap wide = card(out, WIDE_W, WIDE_H), tall = card(poster != null ? poster : out, TALL_W, TALL_H);
+            if (poster != null) poster.recycle();
+            boolean dark = logo != null && logoLuminance(logo) < 0.35f;
+            Bitmap titleLogo = logo == null ? null : gpu(logo);
             int[] frost = reduce(out, FW, FH, 3, 3);
             int[] light = whiten(frost.clone(), 0.82f);
             int[] glass = reduce(out, GW, GH, 2, 2);
@@ -80,7 +91,7 @@ final class Backdrop {
             int[] night = darken(frost.clone(), 0.76f);
             int[] nightGlass = darken(glass, 0.56f);
             out.recycle();
-            return new Backdrop(null, frost, null, wide, tall, light, lightGlass, night, nightGlass);
+            return new Backdrop(null, frost, null, wide, tall, titleLogo, dark, light, lightGlass, night, nightGlass);
         }
 
         float boost = Math.max(0, Math.min(0.3f, (luminance(out, 0, 0.22f, 0.5f, 0.62f) - 0.22f) * 1.1f));
@@ -105,9 +116,27 @@ final class Backdrop {
                 new float[] {0, 0.5f, 1}, Shader.TileMode.CLAMP));
         c.drawRect(0, 0, W, H * 0.24f, scrim);
 
+        if (poster != null) poster.recycle();   // the dark design draws no cards of its own
+        if (logo != null) logo.recycle();
         int[] frost = reduce(out, FW, FH, 3, 3);
         int[] glass = reduce(out, GW, GH, 2, 2);
-        return new Backdrop(gpu(out), frost, glass, null, null, null, null, null, null);
+        return new Backdrop(gpu(out), frost, glass, null, null, null, false, null, null, null, null);
+    }
+
+    /** Average luminance (0 to 1) of a logo's visible ink: transparent pixels don't count. */
+    private static float logoLuminance(Bitmap b) {
+        int stepX = Math.max(1, b.getWidth() / 48), stepY = Math.max(1, b.getHeight() / 48);
+        double sum = 0, weight = 0;
+        for (int y = 0; y < b.getHeight(); y += stepY) {
+            for (int x = 0; x < b.getWidth(); x += stepX) {
+                int p = b.getPixel(x, y);
+                int a = p >>> 24;
+                if (a < 32) continue;
+                sum += a * (0.2126 * ((p >> 16) & 255) + 0.7152 * ((p >> 8) & 255) + 0.0722 * (p & 255)) / 255.0;
+                weight += a;
+            }
+        }
+        return weight == 0 ? 1 : (float) (sum / weight);
     }
 
     /** How many times smaller the screensaver photo's frosted version is (the glass math uses the same number). */

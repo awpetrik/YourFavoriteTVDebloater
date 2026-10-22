@@ -36,8 +36,8 @@ import java.util.concurrent.Executors;
 /**
  * Home screen picks ("This morning / afternoon / tonight"): what's trending this week plus recent releases, only from
  * the streaming apps installed on the TV (Netflix, Prime Video, Disney+, Max, Apple TV, Okko, Hulu, Paramount+, Peacock,
- * Globoplay...), via TMDB (an open movie database that knows what streams where in each country). Three per hour.
- * "Watch" opens the service's app.
+ * Globoplay...), via TMDB (an open movie database that knows what streams where in each country). The home screen
+ * shows a row of ten per tab; the hero keeps three per hour. "Watch" opens the service's app.
  *
  * Each person uses their own free TMDB key (config.properties "tmdb_key", built into the app). It never goes to the log.
  */
@@ -46,6 +46,13 @@ final class Recs {
         int id;
         String kind;            // "movie" or "tv"
         String title, backdrop, meta = "", app, pkg;
+        /**
+         * The 2:3 poster, drawn on the two narrow cards. null when TMDB has none: those cards then crop the
+         * backdrop, which is what they did before posters existed.
+         */
+        String poster;
+        /** The title's logo (a transparent PNG from TMDB's images), drawn on the cards instead of a text title. */
+        String logo;
         String link;            // opens the title in its app (looked up with Watchmode), or null: the app's home
         boolean detailed;
     }
@@ -55,11 +62,18 @@ final class Recs {
     private static final String API = "https://api.themoviedb.org/3";
     /** The backdrops: on a 720p UI, TMDB's 1280-wide copy shows the same and is lighter to download and decode. */
     private static final String IMAGES = "https://image.tmdb.org/t/p/" + (Backdrop.W <= 1280 ? "w1280" : "original");
+    /**
+     * The posters for the two narrow cards: 2:3, and 500 wide already covers the card (Backdrop.TALL_W, 336 on a
+     * 1080p UI) with room for the focus zoom.
+     */
+    private static final String POSTERS = "https://image.tmdb.org/t/p/w500";
     /** TMDB's Animation genre (movies and shows: cartoons and anime), left out with hide_animation=true. */
     private static final int ANIMATION = 16;
     private static final long LIST_EVERY = 6 * 3600_000L;
     /** Bump when what is saved for each title changes (the saved list is discarded and fetched again). */
-    private static final int CACHE_VERSION = 3;
+    private static final int CACHE_VERSION = 5;
+    /** How many picks a home screen tab's row holds. */
+    static final int ROW_LIMIT = 10;
     private static final int MANHA = 0, TARDE = 1, NOITE = 2;
     /** Service name on TMDB (part of the name, lowercase) → TV app (HomeApps key, package). */
     private static final String[][] SERVICES = {
@@ -183,6 +197,15 @@ final class Recs {
 
     /** This hour's 3, movies only ("movie") or shows only ("tv"); null = both (the home screen tabs). */
     List<Pick> now(String kind) {
+        return now(kind, 3);
+    }
+
+    /**
+     * Up to `limit` picks, movies only ("movie") or shows only ("tv"); null = both (the home screen tabs).
+     * A short list (the hero's three) rotates by the hour; a row's ten keep the ranked order, so a title stays
+     * where the hand learned to find it.
+     */
+    List<Pick> now(String kind, int limit) {
         List<Pick> list = new ArrayList<>();
         if (!hasKey(context)) return list;    // no TMDB key: no recommendations
         Map<String, Boolean> have = new HashMap<>();   // one look per app, not per title (this runs every 15 s)
@@ -192,11 +215,12 @@ final class Recs {
         }
         if (list.isEmpty()) return list;
         long hour = System.currentTimeMillis() / 3600_000L;
-        // Three per hour, never two from the same franchise ("Law & Order" and "Law & Order: Special…").
+        int start = limit <= 3 ? (int) ((hour * limit) % list.size()) : 0;
+        // Never two from the same franchise ("Law & Order" and "Law & Order: Special…").
         List<Pick> out = new ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
-        for (int i = 0; i < list.size() && out.size() < 3; i++) {
-            Pick p = list.get((int) ((hour * 3 + i) % list.size()));
+        for (int i = 0; i < list.size() && out.size() < limit; i++) {
+            Pick p = list.get((start + i) % list.size());
             if (seen.add(franchise(p.title))) out.add(p);
         }
         return out;
@@ -240,6 +264,16 @@ final class Recs {
 
     private File imageFile(Pick p) {
         return new File(new File(context.getCacheDir(), "recs"), p.backdrop.replace("/", ""));
+    }
+
+    /** The pick's poster on disk; the prefix keeps it from ever colliding with a backdrop's file name. */
+    private File posterFile(Pick p) {
+        return new File(new File(context.getCacheDir(), "recs"), "poster" + p.poster.replace("/", ""));
+    }
+
+    /** The pick's logo on disk, with its own prefix like the poster's. */
+    private File logoFile(Pick p) {
+        return new File(new File(context.getCacheDir(), "recs"), "logo" + p.logo.replace("/", ""));
     }
 
     /** With a key: fetches the list if stale or the time of day (morning/afternoon/night) changed; then the details. */
@@ -366,7 +400,7 @@ final class Recs {
         List<Pick> out = new ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
         for (String kind : new String[] {null, "movie", "tv"}) {
-            for (Pick p : now(kind)) if (seen.add(key(p))) out.add(p);
+            for (Pick p : now(kind, ROW_LIMIT)) if (seen.add(key(p))) out.add(p);
         }
         return out;
     }
@@ -468,6 +502,8 @@ final class Recs {
         p.kind = kind;
         p.title = o.optString(kind.equals("movie") ? "title" : "name");
         p.backdrop = backdrop;
+        String poster = o.optString("poster_path", "");
+        p.poster = poster.isEmpty() || "null".equals(poster) ? null : poster;
         list.add(p);
     }
 
@@ -484,6 +520,10 @@ final class Recs {
         p.title = title(p, o);
         String best = bestBackdrop(o.optJSONObject("images"));
         if (best != null) p.backdrop = best;
+        String bestPoster = bestPoster(o.optJSONObject("images"));
+        if (bestPoster != null) p.poster = bestPoster;
+        String bestLogo = bestLogo(o.optJSONObject("images"), o.optString("original_language"));
+        if (bestLogo != null) p.logo = bestLogo;
         List<String> parts = new ArrayList<>();
         JSONArray genres = o.optJSONArray("genres");
         if (p.kind.equals("tv")) parts.add(Ui.tr("Series"));
@@ -563,6 +603,61 @@ final class Recs {
             if (score > bestScore) {
                 bestScore = score;
                 best = b.optString("file_path");
+            }
+        }
+        return best;
+    }
+
+    /**
+     * The title's best poster for the two narrow cards: no text written over it, the closest to the card's width
+     * (Backdrop.TALL_W) rather than to a screen, and, on a tie, the highest rated.
+     */
+    private static String bestPoster(JSONObject images) {
+        JSONArray list = images == null ? null : images.optJSONArray("posters");
+        String best = null;
+        double bestScore = -1;
+        int target = Backdrop.TALL_W;
+        for (int i = 0; list != null && i < list.length(); i++) {
+            JSONObject b = list.optJSONObject(i);
+            if (b == null || b.optString("file_path", "").isEmpty()) continue;
+            boolean textless = b.isNull("iso_639_1");
+            int width = b.optInt("width");
+            // Two of the card's widths is as far as a bigger copy is still useful; past that it only costs decoding.
+            double score = (textless ? 1e7 : 0) + Math.min(width, target) * 100 - Math.max(0, width - target * 2) + b.optDouble("vote_average", 0);
+            if (score > bestScore) {
+                bestScore = score;
+                best = b.optString("file_path");
+            }
+        }
+        return best;
+    }
+
+    /**
+     * The title's best logo: a PNG (the app draws no SVG), in the TV's language first, then English, then the
+     * title's own language, then a language-free one; on a tie, the closest to 500 wide and the highest rated.
+     * The details request already asks TMDB for images in those languages, so this costs no extra request.
+     */
+    private static String bestLogo(JSONObject images, String originalLanguage) {
+        JSONArray list = images == null ? null : images.optJSONArray("logos");
+        String uiLanguage = Ui.language.replaceAll("-.*", "");
+        String best = null;
+        double bestScore = -1;
+        for (int i = 0; list != null && i < list.length(); i++) {
+            JSONObject b = list.optJSONObject(i);
+            if (b == null) continue;
+            String path = b.optString("file_path", "");
+            if (path.isEmpty() || !path.endsWith(".png")) continue;
+            double score;
+            if (b.isNull("iso_639_1")) score = 5e6;
+            else if (uiLanguage.equals(b.optString("iso_639_1"))) score = 3e7;
+            else if ("en".equals(b.optString("iso_639_1"))) score = 2e7;
+            else if (b.optString("iso_639_1").equals(originalLanguage)) score = 1e7;
+            else continue;   // a logo in some other language reads as a wrong title
+            int width = b.optInt("width");
+            score += Math.min(width, 500) * 100 - Math.max(0, width - 1000) + b.optDouble("vote_average", 0);
+            if (score > bestScore) {
+                bestScore = score;
+                best = path;
             }
         }
         return best;
@@ -682,15 +777,34 @@ final class Recs {
         return key.isEmpty() ? null : key;
     }
 
-    // MARK: - Images (TMDB originals on disk, up to 24 so the whole list fits; this hour's kept ready in memory)
+    // MARK: - Images (TMDB originals on disk, one backdrop and one poster per pick; this hour's kept ready in memory)
 
     private void download(Pick p) throws IOException {
-        File f = imageFile(p);
+        fetch(IMAGES + p.backdrop, imageFile(p));
+        if (p.poster != null) {
+            // Best effort: a poster that will not come down leaves the two narrow cards cropping the backdrop, which
+            // is what they did before posters.
+            try {
+                fetch(POSTERS + p.poster, posterFile(p));
+            } catch (IOException ignored) {
+            }
+        }
+        if (p.logo != null) {
+            // Best effort like the poster: no logo leaves the card drawing the title as text, as before.
+            try {
+                fetch(POSTERS + p.logo, logoFile(p));
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    /** Downloads url into f, unless f is already there. */
+    private void fetch(String url, File f) throws IOException {
         if (f.exists()) return;
         //noinspection ResultOfMethodCallIgnored
         f.getParentFile().mkdirs();
         File part = new File(f.getPath() + ".part");
-        HttpURLConnection c = (HttpURLConnection) new URL(IMAGES + p.backdrop).openConnection();
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(8000);
         c.setReadTimeout(20000);
         try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(part)) {
@@ -726,11 +840,11 @@ final class Recs {
             if (b == null) throw new IOException("unreadable image");
             AppLog.w("backdrop \u201c" + p.title + "\u201d: " + bounds.outWidth + "×" + bounds.outHeight + " → " + Backdrop.W + "×" + Backdrop.H);
             boolean forLight = light;
-            Backdrop backdrop = Backdrop.make(b, forLight);
+            Backdrop backdrop = Backdrop.make(b, forLight ? decodePoster(p) : null, forLight ? decodeLogo(p) : null, forLight);
             if (forLight != light) return;   // the design changed midway: this one is stale
             synchronized (images) {
                 images.put(p.backdrop, backdrop);
-                while (images.size() > (forLight ? 10 : 4)) images.remove(images.keySet().iterator().next());
+                while (images.size() > (forLight ? 12 : 4)) images.remove(images.keySet().iterator().next());
             }
             notifyListeners();
         } catch (IOException | RuntimeException | OutOfMemoryError e) {
@@ -740,10 +854,54 @@ final class Recs {
         }
     }
 
+    /**
+     * The pick's poster, sampled down to about the card's width; null when it is missing, unreadable or the decode
+     * fails, which leaves Backdrop cropping the photo for the two narrow cards.
+     */
+    private Bitmap decodePoster(Pick p) {
+        if (p.poster == null) return null;
+        File f = posterFile(p);
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(f.getPath(), bounds);
+            if (bounds.outWidth <= 0) return null;
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = 1;
+            while (bounds.outWidth / (opts.inSampleSize * 2) >= Backdrop.TALL_W) opts.inSampleSize *= 2;
+            Bitmap poster = BitmapFactory.decodeFile(f.getPath(), opts);
+            AppLog.w("poster \u201c" + p.title + "\u201d: " + bounds.outWidth + "×" + bounds.outHeight + " → " + Backdrop.TALL_W + "×" + Backdrop.TALL_H);
+            return poster;
+        } catch (RuntimeException | OutOfMemoryError e) {
+            return null;
+        }
+    }
+
+    /**
+     * The pick's logo at its downloaded size (w500 covers the wide card's logo box); null when it is missing or
+     * unreadable, which leaves the card drawing the title as text.
+     */
+    private Bitmap decodeLogo(Pick p) {
+        if (p.logo == null) return null;
+        File f = logoFile(p);
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(f.getPath(), bounds);
+            if (bounds.outWidth <= 0) return null;
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = 1;
+            while (bounds.outWidth / (opts.inSampleSize * 2) >= 500) opts.inSampleSize *= 2;
+            return BitmapFactory.decodeFile(f.getPath(), opts);
+        } catch (RuntimeException | OutOfMemoryError e) {
+            return null;
+        }
+    }
+
     void trim() {
         // Explore's picks stay: the home screen opens on that tab, so its cards are never gray when you come back.
         java.util.Set<String> keep = new java.util.HashSet<>();
-        for (Pick p : now(null)) if (p.backdrop != null) keep.add(p.backdrop);
+        for (Pick p : now(null, ROW_LIMIT)) if (p.backdrop != null) keep.add(p.backdrop);
         synchronized (images) {
             images.keySet().retainAll(keep);
         }
@@ -758,9 +916,10 @@ final class Recs {
             if (parts[i].lastModified() < stale) parts[i].delete();
         }
         File[] files = dir.listFiles((d, name) -> !name.endsWith(".part"));
-        if (files == null || files.length <= 24) return;
+        // 24 backdrops and the poster and logo that go with each one, so a full list survives without re-downloading.
+        if (files == null || files.length <= 72) return;
         Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
-        for (int i = 0; i < files.length - 24; i++) {
+        for (int i = 0; i < files.length - 72; i++) {
             //noinspection ResultOfMethodCallIgnored
             files[i].delete();
         }
@@ -773,6 +932,8 @@ final class Recs {
             JSONArray a = new JSONArray();
             for (Pick p : picks) {
                 a.put(new JSONObject().put("id", p.id).put("kind", p.kind).put("title", p.title).put("backdrop", p.backdrop).put("link", p.link == null ? "" : p.link)
+                        .put("poster", p.poster == null ? "" : p.poster)
+                        .put("logo", p.logo == null ? "" : p.logo)
                         .put("meta", p.meta).put("app", p.app == null ? "" : p.app).put("pkg", p.pkg == null ? "" : p.pkg)
                         .put("detailed", p.detailed));
             }
@@ -798,6 +959,8 @@ final class Recs {
             p.kind = o.optString("kind");
             p.title = o.optString("title");
             p.backdrop = o.optString("backdrop");
+            p.poster = o.optString("poster").isEmpty() ? null : o.optString("poster");
+            p.logo = o.optString("logo").isEmpty() ? null : o.optString("logo");
             p.link = o.optString("link").isEmpty() ? null : o.optString("link");
             p.meta = o.optString("meta");
             p.app = o.optString("app").isEmpty() ? null : o.optString("app");
